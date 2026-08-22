@@ -1,0 +1,1817 @@
+#!/usr/bin/env python3
+"""
+monitor_indian_land.py
+
+Polls Indian Land Warriors (Fort Mill, SC) team pages on MaxPreps and alerts
+you when something changes: record, rank, next game, a new result posted,
+or standings movement. Produces a single ESPN-style HTML dashboard with a
+tab per sport.
+
+Sports watched:
+  - Football
+  - Basketball
+  - Soccer                (spring)
+  - Volleyball (Girls)
+  - Volleyball (Boys)     (fall)
+  - Baseball
+  - Softball
+
+For each sport, four pages are watched:
+  - Team home        (overall/region record, rank)
+  - Schedule          (games, results, next game)
+  - Standings         (region + class standings)
+  - Stats              (team leaders / star players)
+
+Usage:
+  python monitor_indian_land.py                # run forever, poll every 30 min
+  python monitor_indian_land.py --once         # single check, print report, exit
+  python monitor_indian_land.py --interval 15  # poll every 15 minutes
+  python monitor_indian_land.py --state my.json --log my.log
+
+Requires:
+  pip install requests beautifulsoup4 lxml
+"""
+
+import argparse
+import json
+import logging
+import re
+import sys
+import time
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+
+import requests
+from bs4 import BeautifulSoup
+
+try:
+    import cloudscraper  # pip install cloudscraper
+    _HAS_CLOUDSCRAPER = True
+except ImportError:
+    _HAS_CLOUDSCRAPER = False
+
+
+# --------------------------------------------------------------------------- #
+# Sport registry
+# --------------------------------------------------------------------------- #
+
+def _pages(base: str) -> dict:
+    """Build the standard {home, schedule, standings, stats} page set from a
+    team's base MaxPreps URL."""
+    return {
+        "home": base,
+        "schedule": base + "schedule/",
+        "standings": base + "standings/",
+        "stats": base + "stats/",
+    }
+
+
+FOOTBALL_BASE = "https://www.maxpreps.com/sc/fort-mill/indian-land-warriors/football/"
+BASKETBALL_BASE = "https://www.maxpreps.com/sc/fort-mill/indian-land-warriors/basketball/"
+SOCCER_BASE = "https://www.maxpreps.com/sc/fort-mill/indian-land-warriors/soccer/spring/"
+VOLLEYBALL_GIRLS_BASE = "https://www.maxpreps.com/sc/fort-mill/indian-land-warriors/volleyball/"
+VOLLEYBALL_BOYS_BASE = "https://www.maxpreps.com/sc/fort-mill/indian-land-warriors/volleyball/boys/fall/"
+BASEBALL_BASE = "https://www.maxpreps.com/sc/fort-mill/indian-land-warriors/baseball/"
+SOFTBALL_BASE = "https://www.maxpreps.com/sc/fort-mill/indian-land-warriors/softball/"
+
+# "slug" is the URL segment MaxPreps uses for this sport -- it's how we
+# recognize an opponent/player link belongs to this sport's pages
+# (e.g. ".../football/" vs ".../soccer/").
+SPORTS = [
+    {"key": "football", "label": "Football", "icon": "\U0001F3C8",
+     "slug": "football", "pages": _pages(FOOTBALL_BASE)},
+    {"key": "basketball", "label": "Basketball", "icon": "\U0001F3C0",
+     "slug": "basketball", "pages": _pages(BASKETBALL_BASE)},
+    {"key": "soccer", "label": "Soccer", "icon": "\u26BD",
+     "slug": "soccer", "pages": _pages(SOCCER_BASE)},
+    {"key": "volleyball_girls", "label": "Volleyball (Girls)", "icon": "\U0001F3D0",
+     "slug": "volleyball", "pages": _pages(VOLLEYBALL_GIRLS_BASE)},
+    {"key": "volleyball_boys", "label": "Volleyball (Boys)", "icon": "\U0001F3D0",
+     "slug": "volleyball", "pages": _pages(VOLLEYBALL_BOYS_BASE)},
+    {"key": "baseball", "label": "Baseball", "icon": "\u26BE",
+     "slug": "baseball", "pages": _pages(BASEBALL_BASE)},
+    {"key": "softball", "label": "Softball", "icon": "\U0001F94E",
+     "slug": "softball", "pages": _pages(SOFTBALL_BASE)},
+]
+SPORTS_BY_KEY = {s["key"]: s for s in SPORTS}
+
+# Kept for backward compatibility with anything referencing the old names.
+BASE = FOOTBALL_BASE
+FOOTBALL_PAGES = SPORTS_BY_KEY["football"]["pages"]
+BASKETBALL_PAGES = SPORTS_BY_KEY["basketball"]["pages"]
+PAGES = FOOTBALL_PAGES
+
+YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@ILHS_Warrior_News_Network"
+
+HEADERS = {
+    # A full set of normal-browser headers. MaxPreps rejects requests (406)
+    # that look automated -- e.g. missing Accept/Accept-Language/Referer,
+    # or a bare "python-requests" User-Agent.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Referer": "https://www.maxpreps.com/",
+}
+
+# A single session lets us keep cookies (e.g. anti-bot / session cookies)
+# across requests, which real browser navigation also does.
+# cloudscraper (if installed) knows how to solve the Cloudflare-style
+# JS/browser check that plain `requests` gets a 406/403 from. Falls back
+# to a plain requests.Session if cloudscraper isn't installed.
+if _HAS_CLOUDSCRAPER:
+    SESSION = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+else:
+    SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+
+DEFAULT_STATE_FILE = "indian_land_state.json"
+DEFAULT_LOG_FILE = "indian_land_monitor.log"
+DEFAULT_HTML_FILE = "indian_land_dashboard.html"
+
+RECORD_RE = re.compile(r"\b(\d+)\s*-\s*(\d+)\b")
+NO_DATA = "No data"
+
+
+# --------------------------------------------------------------------------- #
+# Fetching
+# --------------------------------------------------------------------------- #
+
+def fetch(url: str, retries: int = 3, timeout: int = 15) -> str:
+    """GET a page with retries/backoff. Returns HTML text or raises."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = SESSION.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.text
+        except requests.RequestException as e:
+            last_err = e
+            wait = 2 ** attempt
+            logging.warning("Fetch failed (%s/%s) for %s: %s -- retrying in %ss",
+                             attempt, retries, url, e, wait)
+            time.sleep(wait)
+    raise RuntimeError(f"Could not fetch {url}: {last_err}")
+
+
+# --------------------------------------------------------------------------- #
+# Parsing helpers
+# --------------------------------------------------------------------------- #
+
+def parse_overview(html: str) -> dict:
+    """Pull Overall record, Region record, and state rank from any team page
+    (the header block with these stats appears on every team subpage)."""
+    soup = BeautifulSoup(html, "lxml")
+    text_blocks = [t.strip() for t in soup.stripped_strings]
+
+    def value_after(label: str):
+        for i, t in enumerate(text_blocks):
+            if t.lower() == label.lower():
+                # value is usually the very next non-empty string
+                if i + 1 < len(text_blocks):
+                    return text_blocks[i + 1]
+        return None
+
+    overall = value_after("Overall")
+    region = value_after("Region")
+    rank = None
+    for i, t in enumerate(text_blocks):
+        if t.lower().endswith("rank"):
+            if i + 1 < len(text_blocks):
+                rank = text_blocks[i + 1]
+            break
+
+    return {
+        "overall_record": overall,
+        "region_record": region,
+        "state_rank": rank,
+    }
+
+
+def parse_schedule(html: str, sport_slug: str = "football") -> list:
+    """Parse MaxPreps schedules across table and card/list layouts.
+
+    MaxPreps has changed the football schedule markup over time. Some pages
+    expose a normal <table>, while others render games as cards/divs. This
+    parser deliberately supports both layouts.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    games = []
+    seen = set()
+
+    date_re = re.compile(r"^\s*(\d{1,2}/\d{1,2})(?:\s*\|?\s*(\d{1,2}:\d{2}\s*[ap]m))?", re.I)
+    date_any_re = re.compile(r"\b\d{1,2}/\d{1,2}(?:\s*\d{1,2}:\d{2}\s*[ap]m)?", re.I)
+    action_re = re.compile(r"preview game|box ?score|recap|tickets|live stream|watch|score game", re.I)
+
+    def clean_opponent(text):
+        if not text:
+            return None
+        text = re.sub(r"^(?:vs|@)\s*", "", text.strip(), flags=re.I)
+        text = re.sub(r"[|•]+.*$", "", text).strip()
+        return text or None
+
+    def extract_from_row(row):
+        row_text = row.get_text(" ", strip=True)
+        if not date_any_re.search(row_text):
+            return None
+
+        date_time_raw = None
+        for a in row.find_all("a"):
+            txt = a.get_text(" ", strip=True)
+            if date_re.match(txt):
+                date_time_raw = txt
+                break
+        if date_time_raw is None:
+            m = date_any_re.search(row_text)
+            date_time_raw = m.group(0) if m else None
+
+        home_away = None
+        if re.search(r"(?:^|\s)vs(?:\s|$)", row_text, re.I):
+            home_away = "vs"
+        elif re.search(r"(?:^|\s)@(?:\s|$)", row_text):
+            home_away = "@"
+
+        opp_link = None
+        for a in row.find_all("a"):
+            href = a.get("href", "") or ""
+            text = a.get_text(" ", strip=True)
+            if not text or action_re.search(text):
+                continue
+            if "indian land" in text.lower():
+                continue
+            if f"/{sport_slug}/" in href and not date_any_re.match(text):
+                opp_link = a
+                break
+
+        opponent = clean_opponent(opp_link.get_text(" ", strip=True)) if opp_link else None
+        if opponent is None and home_away:
+            marker = re.search(r"(?:^|\s)(?:vs|@)\s*([^|•]+)", row_text, re.I)
+            if marker:
+                candidate = clean_opponent(marker.group(1))
+                candidate = action_re.sub("", candidate or "").strip()
+                if candidate and len(candidate) < 60:
+                    opponent = candidate
+
+        if not opponent:
+            return None
+
+        result_match = re.search(r"\b([WL])\s*(\d+\s*-\s*\d+)\b", row_text, re.I)
+        if result_match:
+            result = f"{result_match.group(1).upper()} {result_match.group(2).replace(' ', '')}"
+        elif re.search(r"\bfinal\b", row_text, re.I):
+            result = "Final (score not parsed)"
+        elif re.search(r"\b(ppd|postponed|cancell?ed|forfeit)\b", row_text, re.I):
+            result = "Postponed"
+        else:
+            result = None
+
+        opponent_logo_url = None
+        for img in row.find_all("img"):
+            src = img.get("src", "") or ""
+            alt = img.get("alt", "") or ""
+            if "school-mascot" in src and "indian land" not in alt.lower():
+                opponent_logo_url = src
+                break
+
+        game_info_url = None
+        info_link = row.find("a", string=re.compile(r"Preview Game|Box Score|Recap", re.I))
+        if info_link:
+            game_info_url = info_link.get("href")
+        elif opp_link:
+            game_info_url = opp_link.get("href")
+
+        key = (_normalize_team_name(opponent), date_time_raw, home_away)
+        if key in seen:
+            return None
+        seen.add(key)
+        return {
+            "date_time_raw": date_time_raw,
+            "opponent": opponent,
+            "opponent_logo_url": opponent_logo_url,
+            "home_away": home_away,
+            "result": result,
+            "game_info_url": game_info_url,
+        }
+
+    # 1) Preferred: real table rows.
+    for tbl in soup.find_all("table"):
+        for row in tbl.find_all("tr"):
+            game = extract_from_row(row)
+            if game:
+                games.append(game)
+
+    # 2) Fallback: card/list markup. Start at date links and walk upward.
+    if not games:
+        for date_link in soup.find_all("a"):
+            txt = date_link.get_text(" ", strip=True)
+            if not date_re.match(txt):
+                continue
+            container = date_link
+            for _ in range(6):
+                container = container.parent
+                if container is None:
+                    break
+                if date_any_re.search(container.get_text(" ", strip=True)):
+                    game = extract_from_row(container)
+                    if game:
+                        games.append(game)
+                        break
+
+    # 3) Last-resort fallback for newer div-based football markup.
+    if not games:
+        for node in soup.find_all(["li", "article", "div"]):
+            text = node.get_text(" ", strip=True)
+            if len(text) > 500 or not date_any_re.search(text):
+                continue
+            if not re.search(r"(?:^|\s)(?:vs|@)(?:\s|[A-Z])", text, re.I):
+                continue
+            game = extract_from_row(node)
+            if game:
+                games.append(game)
+
+    if not games:
+        logging.warning("Could not locate any schedule games in MaxPreps HTML.")
+    return games
+
+
+def parse_up_next(html: str) -> dict:
+    """Parse MaxPreps' home-page Up Next card as a schedule fallback."""
+    soup = BeautifulSoup(html, "lxml")
+    heading = None
+    for tag in soup.find_all(["h1", "h2", "h3", "strong", "span", "div"]):
+        if tag.get_text(" ", strip=True).lower() == "up next":
+            heading = tag
+            break
+    if heading is None:
+        return None
+
+    container = heading
+    for _ in range(7):
+        container = container.parent
+        if container is None:
+            break
+        text = container.get_text(" ", strip=True)
+        if re.search(r"\b\d{1,2}/\d{1,2}\b", text) and re.search(r"(?:vs|@)", text, re.I):
+            break
+    if container is None:
+        return None
+
+    text = container.get_text(" ", strip=True)
+    date_match = re.search(r"\b(\d{1,2}/\d{1,2}(?:\s*\d{1,2}:\d{2}\s*[ap]m)?)\b", text, re.I)
+    matchup = re.search(r"(?:^|\s)(vs|@)\s*([A-Za-z0-9][A-Za-z0-9 .&'’_-]{2,60}?)(?=\s+(?:Watch|Buy Tickets|Score Game|Preview Game|Game Info|$))", text, re.I)
+    if not matchup:
+        matchup = re.search(r"(?:^|\s)(vs|@)\s*([A-Za-z0-9][A-Za-z0-9 .&'’_-]{2,60})", text, re.I)
+    if not matchup:
+        return None
+
+    opponent = matchup.group(2).strip(" .")
+    if not opponent or "indian land" in opponent.lower():
+        return None
+
+    return {
+        "date_time_raw": date_match.group(1) if date_match else "TBD",
+        "opponent": opponent,
+        "opponent_logo_url": None,
+        "home_away": matchup.group(1).lower(),
+        "result": None,
+        "game_info_url": None,
+    }
+
+def parse_team_logo(html: str) -> str:
+    """Find Indian Land's own school mascot/logo image URL on a team page."""
+    soup = BeautifulSoup(html, "lxml")
+    fallback = None
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        if "school-mascot" not in src:
+            continue
+        alt = (img.get("alt") or "")
+        if "indian land" in alt.lower():
+            return src
+        if fallback is None:
+            fallback = src  # first mascot image on the page, just in case alt text is missing
+    return fallback
+
+
+def _normalize_team_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def parse_last_game(html: str, home_team_hint: str = "indian land") -> dict:
+    """Parse the "Last Game" widget on a team home page.
+
+    MaxPreps calls out the most recently completed game here -- with the
+    final score -- often *before* the full schedule table gets updated
+    with a score for that same game. That lag is exactly what was making
+    an already-finished game still look like the "next game": the
+    schedule page's row for it still had no score in it, so it looked
+    upcoming even though it had already been played.
+
+    Returns {"opponent": str, "result": "W 49-0"} or None if there's no
+    "Last Game" widget on the page (e.g. season hasn't started yet).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    home_hint_norm = _normalize_team_name(home_team_hint)
+    heading = None
+    for tag in soup.find_all(["h1", "h2", "h3", "strong", "span", "div"]):
+        if tag.get_text(strip=True).lower() == "last game":
+            heading = tag
+            break
+    if heading is None:
+        return None
+
+    # The two team score links immediately follow the heading, each like
+    # "Indian Land Indian Land49" (name repeated + score glued on the end).
+    score_links = []
+    for a in heading.find_all_next("a", limit=12):
+        text = a.get_text(strip=True)
+        m = re.search(r"(\d{1,3})$", text)
+        if m and len(text) > len(m.group(1)):
+            score_links.append((text, int(m.group(1))))
+        if len(score_links) >= 2:
+            break
+
+    if len(score_links) < 2:
+        return None
+
+    (text1, score1), (text2, score2) = score_links[0], score_links[1]
+    if home_hint_norm in _normalize_team_name(text1):
+        team_score, opp_score, opp_text = score1, score2, text2
+    elif home_hint_norm in _normalize_team_name(text2):
+        team_score, opp_score, opp_text = score2, score1, text1
+    else:
+        return None  # couldn't confidently identify which side is us
+
+    # Strip the trailing score digits off the opponent text, and collapse
+    # a duplicated name (name appears twice back-to-back in the raw text).
+    opp_name = re.sub(r"\d{1,3}$", "", opp_text).strip()
+    half = len(opp_name) // 2
+    if half > 2 and opp_name[:half].strip() == opp_name[half:].strip():
+        opp_name = opp_name[:half].strip()
+
+    if team_score > opp_score:
+        result = f"W {team_score}-{opp_score}"
+    elif team_score < opp_score:
+        result = f"L {team_score}-{opp_score}"
+    else:
+        result = f"T {team_score}-{opp_score}"
+
+    return {"opponent": opp_name, "result": result}
+
+
+def parse_standings(html: str) -> dict:
+    """Parse region + class standings tables into {section_name: [rows]}."""
+    soup = BeautifulSoup(html, "lxml")
+    sections = {}
+
+    tables = soup.find_all("table")
+
+    # Enumerate tables and try to find a nearby heading text
+    for tbl in tables:
+        heading_text = None
+        prev = tbl.find_previous(["h2", "h3"])
+        if prev:
+            heading_text = prev.get_text(strip=True)
+        else:
+            heading_text = f"Standings table {len(sections) + 1}"
+
+        rows = []
+        for tr in tbl.find_all("tr"):
+            cells = [c.get_text(strip=True) for c in tr.find_all(["td", "th"])]
+            cells = [c for c in cells if c]
+            if not cells:
+                continue
+            row_text = " ".join(cells)
+            if not RECORD_RE.search(row_text):
+                continue  # skip header rows without a W-L record
+            team_link = tr.find("a")
+            team_name = team_link.get_text(strip=True) if team_link else (cells[0] if cells else None)
+            record_match = RECORD_RE.search(row_text)
+            record = record_match.group(0) if record_match else None
+            rows.append({"team": team_name, "record": record, "raw": cells})
+
+        if rows:
+            sections[heading_text] = rows
+
+    return sections
+
+
+def parse_star_players(html: str, sport_slug: str = "football") -> list:
+    """Parse the 'Team Leaders' section of the stats page into a list of
+    {category, player, value, player_url} dicts.
+
+    MaxPreps shows this as one card/table per stat category (Passing Yards,
+    Kills, Goals, Batting Average, etc.) once the coach/stat-keeper has
+    entered game data. Early in the season it commonly says
+    "Player Stats Not Entered" -- in that case we return an empty list and
+    the dashboard shows "No data" instead of erroring.
+
+    Every MaxPreps page also has a sitewide footer nav block headed
+    "Popular Sports" listing links to every sport's home page (Football,
+    Basketball, Volleyball, ...) -- those links match the same
+    `/{sport_slug}/` href pattern as real player-profile links, so without
+    scoping the search to the actual Team Leaders section, that footer
+    block gets misread as a stat category ("Popular Sports" showing up as
+    a player name). We anchor on the "Team Leaders" heading itself and
+    only look at headings between it and the next unrelated section.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    page_text = soup.get_text(" ", strip=True)
+
+    if re.search(r"not entered|no data to display", page_text, re.I):
+        return []
+
+    NON_STAT_SECTION_MARKERS = (
+        "meet the team", "nearby", "popular sports", "popular", "schedule at a glance",
+        "standings", "news", "rankings", "roster", "photos", "tickets", "watch",
+    )
+
+    all_headings = soup.find_all(["h2", "h3"])
+    team_leaders_idx = None
+    for i, h in enumerate(all_headings):
+        if h.get_text(strip=True).lower() == "team leaders":
+            team_leaders_idx = i
+            break
+
+    if team_leaders_idx is None:
+        # Can't confidently locate the stats section at all -- bail rather
+        # than risk pulling from an unrelated part of the page.
+        return []
+
+    leaders = []
+    MAX_CATEGORY_HEADINGS = 8
+    for h in all_headings[team_leaders_idx + 1: team_leaders_idx + 1 + MAX_CATEGORY_HEADINGS]:
+        category = h.get_text(strip=True)
+        if not category:
+            continue
+        category_lower = category.lower()
+        if category_lower in ("player stats", "game stats", "team stats"):
+            continue
+        if any(marker in category_lower for marker in NON_STAT_SECTION_MARKERS):
+            break  # hit the next real section of the page -- stop scanning
+
+        container = h.find_next(["table", "ul", "div"])
+        if container is None:
+            continue
+
+        player_links = container.find_all("a", href=re.compile(rf"/{sport_slug}/"))
+        for a in player_links[:3]:  # top 3 per category
+            player_name = a.get_text(strip=True)
+            if not player_name:
+                continue
+            row = a.find_parent(["tr", "li", "div"]) or a
+            row_text = row.get_text(" ", strip=True)
+            value_match = re.search(r"[\d,.]+$", row_text) or re.search(r"\b\d[\d,.]*\b", row_text)
+            value = value_match.group(0) if value_match else None
+
+            leaders.append({
+                "category": category,
+                "player": player_name,
+                "value": value,
+                "player_url": a.get("href"),
+            })
+
+        if len(leaders) >= 15:  # safety cap
+            break
+
+    return leaders
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot / diff
+# --------------------------------------------------------------------------- #
+
+def _is_placeholder_opponent(opponent: str) -> bool:
+    """True for tournament/TBA placeholder rows (e.g. 'TBA', 'TBA*** (Cavs
+    Classic @ Dorman High School)') where the real opponent isn't set yet.
+    These sort chronologically before real, confirmed matchups, so picking
+    the first unresolved row as "next game" without this check surfaces a
+    useless 'Next Game: @ TBA' instead of the next real opponent."""
+    if not opponent:
+        return True
+    stripped = opponent.strip().upper()
+    return stripped == "TBA" or stripped.startswith("TBA*") or stripped.startswith("TBA ")
+
+
+def build_snapshot(pages: dict, sport_slug: str) -> dict:
+    home_html = fetch(pages["home"])
+    time.sleep(1.5)  # brief pause between requests, like real page navigation
+    schedule_html = fetch(pages["schedule"])
+    time.sleep(1.5)
+    standings_html = fetch(pages["standings"])
+    time.sleep(1.5)
+    stats_html = fetch(pages["stats"])
+
+    overview = parse_overview(home_html)
+    schedule = parse_schedule(schedule_html, sport_slug)
+    standings = parse_standings(standings_html)
+    star_players = parse_star_players(stats_html, sport_slug)
+    team_logo_url = parse_team_logo(home_html)
+
+    last_game = None
+    try:
+        last_game = parse_last_game(home_html)
+    except Exception:
+        logging.warning("Could not parse the 'Last Game' widget.", exc_info=True)
+    last_game_norm = _normalize_team_name(last_game["opponent"]) if last_game else None
+
+    # Football's MaxPreps page can expose its schedule as a rendered card rather
+    # than a normal HTML table. The home-page Up Next card is the reliable
+    # fallback for the immediate matchup.
+    up_next = None
+    try:
+        up_next = parse_up_next(home_html)
+    except Exception:
+        logging.warning("Could not parse the 'Up Next' widget.", exc_info=True)
+
+    next_game = None
+    fallback_tba_game = None
+    for g in schedule:
+        if g["result"] is not None:
+            continue
+        opp_norm = _normalize_team_name(g.get("opponent") or "")
+        if last_game_norm and (last_game_norm in opp_norm or opp_norm in last_game_norm):
+            g["result"] = last_game["result"]
+            continue
+        if _is_placeholder_opponent(g.get("opponent")):
+            if fallback_tba_game is None:
+                fallback_tba_game = g
+            continue
+        next_game = g
+        break
+
+    if next_game is None and up_next:
+        next_game = up_next
+    if next_game is None:
+        next_game = fallback_tba_game
+    if not schedule and up_next:
+        schedule = [up_next]
+
+
+    return {
+        "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        "overview": overview,
+        "next_game": next_game,
+        "schedule": schedule,
+        "standings": standings,
+        "star_players": star_players,
+        "team_logo_url": team_logo_url,
+    }
+
+
+def build_combined_snapshot() -> dict:
+    """Fetch every sport in SPORTS and bundle the results together."""
+    sports_snapshot = {}
+    for i, sport in enumerate(SPORTS):
+        if i > 0:
+            time.sleep(2.0)  # pause between sports, like real navigation
+        try:
+            sports_snapshot[sport["key"]] = build_snapshot(sport["pages"], sport["slug"])
+        except Exception as e:
+            logging.error("Failed to fetch %s: %s", sport["label"], e)
+            sports_snapshot[sport["key"]] = None
+
+    return {
+        "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        "sports": sports_snapshot,
+    }
+
+
+def load_state(path: Path):
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:
+            logging.warning("State file was corrupt, starting fresh.")
+    return None
+
+
+def save_state(path: Path, snapshot: dict):
+    path.write_text(json.dumps(snapshot, indent=2))
+
+
+def diff_sport_snapshot(old: dict, new: dict) -> list:
+    """Return a list of human-readable change descriptions for one sport."""
+    changes = []
+    if new is None:
+        return changes
+    if old is None:
+        changes.append("Initial snapshot captured.")
+        return changes
+
+    ov_old, ov_new = old.get("overview", {}), new.get("overview", {})
+    for key, label in [
+        ("overall_record", "Overall record"),
+        ("region_record", "Region record"),
+        ("state_rank", "State rank"),
+    ]:
+        if ov_old.get(key) != ov_new.get(key):
+            changes.append(f"{label} changed: {ov_old.get(key)} -> {ov_new.get(key)}")
+
+    ng_old, ng_new = old.get("next_game"), new.get("next_game")
+    old_opp = ng_old.get("opponent") if ng_old else None
+    new_opp = ng_new.get("opponent") if ng_new else None
+    old_dt = ng_old.get("date_time_raw") if ng_old else None
+    new_dt = ng_new.get("date_time_raw") if ng_new else None
+    if (old_opp, old_dt) != (new_opp, new_dt):
+        changes.append(
+            f"Next game changed: {old_dt} vs/@ {old_opp}  ->  {new_dt} vs/@ {new_opp}"
+        )
+
+    # New results posted (a game that had no result now has one)
+    old_by_key = {(g.get("date_time_raw"), g.get("opponent")): g for g in old.get("schedule", [])}
+    for g in new.get("schedule", []):
+        key = (g.get("date_time_raw"), g.get("opponent"))
+        prev = old_by_key.get(key)
+        if g.get("result") and (prev is None or prev.get("result") != g.get("result")):
+            changes.append(
+                f"Result posted: {g.get('date_time_raw')} vs/@ {g.get('opponent')} -> {g.get('result')}"
+            )
+
+    # Standings movement (team order/records changed within any section)
+    old_st, new_st = old.get("standings", {}), new.get("standings", {})
+    for section, new_rows in new_st.items():
+        old_rows = old_st.get(section)
+        if old_rows != new_rows:
+            changes.append(f"Standings updated: {section}")
+
+    # Star players / stat leaders (newly posted or updated)
+    old_sp, new_sp = old.get("star_players", []), new.get("star_players", [])
+    if not old_sp and new_sp:
+        changes.append("Player stat leaders have been posted for the first time.")
+    elif old_sp != new_sp:
+        changes.append("Player stat leaders updated.")
+
+    return changes
+
+
+def diff_combined_snapshots(old: dict, new: dict) -> dict:
+    """Diff every sport; returns {sport_key: [change, ...], ...}."""
+    old_sports = (old or {}).get("sports", {}) or {}
+    new_sports = new.get("sports", {}) or {}
+    changes = {}
+    for key, new_snap in new_sports.items():
+        changes[key] = diff_sport_snapshot(old_sports.get(key), new_snap)
+    return changes
+
+
+# --------------------------------------------------------------------------- #
+# Reporting
+# --------------------------------------------------------------------------- #
+
+def print_sport_report(sport_name: str, snapshot: dict):
+    print("=" * 60)
+    print(f"Indian Land Warriors {sport_name} \u2014 checked {snapshot.get('fetched_at') or 'unknown'}")
+    print("=" * 60)
+
+    if snapshot is None:
+        print(f"  {NO_DATA} (could not fetch this sport's pages).")
+        print("=" * 60)
+        return
+
+    ov = snapshot.get("overview", {})
+    print(f"Overall record : {ov.get('overall_record') or NO_DATA}")
+    print(f"Region record  : {ov.get('region_record') or NO_DATA}")
+    print(f"State rank     : {ov.get('state_rank') or NO_DATA}")
+    print()
+
+    ng = snapshot.get("next_game")
+    if ng:
+        date_str = ng.get("date_time_raw") or "TBD"
+        opp_str = ng.get("opponent") or "Unknown"
+        ha_str = ng.get("home_away") or ""
+        print(f"Next game: {date_str}  {ha_str} {opp_str}")
+        if ng.get("game_info_url"):
+            print(f"  Info: {ng['game_info_url']}")
+    else:
+        print(f"Next game: {NO_DATA} (season may be complete or schedule not posted).")
+    print()
+
+    print("Full schedule:")
+    schedule = snapshot.get("schedule") or []
+    if schedule:
+        for g in schedule:
+            result = g.get("result") or "upcoming"
+            date_str = g.get("date_time_raw") or "TBD"
+            opp_str = g.get("opponent") or "Unknown"
+            ha_str = g.get("home_away") or "  "
+            print(f"  {date_str:<14} {ha_str} {opp_str:<20} {result}")
+    else:
+        print(f"  {NO_DATA}")
+    print()
+
+    print("Standings:")
+    standings = snapshot.get("standings") or {}
+    if standings:
+        for section, rows in standings.items():
+            print(f"  {section}")
+            for r in rows:
+                team = r.get("team") or "Unknown"
+                record = r.get("record") or "-"
+                marker = " <-- Indian Land" if "Indian Land" in team else ""
+                print(f"    {team:<20} {record}{marker}")
+    else:
+        print(f"  {NO_DATA}")
+    print()
+
+    print("Star players (stat leaders):")
+    star_players = snapshot.get("star_players", [])
+    if star_players:
+        for sp in star_players:
+            val = f" -- {sp['value']}" if sp.get("value") else ""
+            print(f"  [{sp['category']}] {sp['player']}{val}")
+    else:
+        print(f"  {NO_DATA} (MaxPreps shows no player stats entered for this team).")
+    print("=" * 60)
+
+
+def print_report(combined_snapshot: dict):
+    sports_snapshot = combined_snapshot.get("sports", {})
+    for sport in SPORTS:
+        snap = sports_snapshot.get(sport["key"])
+        print_sport_report(sport["label"], snap)
+        print()
+
+
+def _esc(s):
+    if s is None:
+        return ""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _render_stat_cards(overview: dict) -> str:
+    return f"""
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="label">Overall</div>
+        <div class="value">{_esc(overview.get('overall_record')) or NO_DATA}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Region</div>
+        <div class="value">{_esc(overview.get('region_record')) or NO_DATA}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">SC Rank</div>
+        <div class="value">{_esc(overview.get('state_rank')) or NO_DATA}</div>
+      </div>
+    </div>"""
+
+
+def _initials(name: str, max_len: int = 2) -> str:
+    """Turn a team name into short initials for a badge, e.g. 'Fort Mill' -> 'FM'."""
+    if not name:
+        return "?"
+    words = re.findall(r"[A-Za-z0-9]+", name)
+    if not words:
+        return "?"
+    if len(words) == 1:
+        return words[0][:max_len].upper()
+    return "".join(w[0] for w in words[:max_len]).upper()
+
+
+def _team_badge_html(logo_url, initials, extra_class="") -> str:
+    """Render a team badge as the real school logo image when we have one,
+    falling back to a text-initials circle (also used if the image 404s)."""
+    initials_esc = _esc(initials)
+    if logo_url:
+        cls = f"team-badge logo-img {extra_class}".strip()
+        return (f'<img class="{cls}" src="{_esc(logo_url)}" alt="{initials_esc}" '
+                f"loading=\"lazy\" onerror=\"logoFallback(this,'{initials_esc}')\">")
+    return f'<div class="team-badge {extra_class}">{initials_esc}</div>'
+
+
+def _render_next_game(next_game: dict, team_logo_url: str = None) -> str:
+    if next_game:
+        opponent = next_game.get('opponent') or 'TBD'
+        ha = (next_game.get('home_away') or '').strip()
+        vs_text = '@' if ha == '@' else 'VS'
+        home_badge = _team_badge_html(team_logo_url, "IL")
+        opp_badge = _team_badge_html(next_game.get('opponent_logo_url'), _initials(opponent), "opp-badge")
+        return f"""
+          <div class="next-game">
+            <div class="ng-label">Next Game</div>
+            <div class="matchup-row">
+              <div class="team-side">
+                {home_badge}
+                <div class="team-name">Indian Land</div>
+              </div>
+              <div class="vs-wrap"><span class="vs-text">{vs_text}</span></div>
+              <div class="team-side">
+                {opp_badge}
+                <div class="team-name">{_esc(opponent)}</div>
+              </div>
+            </div>
+            <div class="ng-date">{_esc(next_game.get('date_time_raw'))}</div>
+          </div>"""
+    return f"""
+          <div class="next-game next-game-empty">
+            <div class="ng-label">Next Game</div>
+            <div class="no-data">{NO_DATA} \u2014 schedule not yet posted.</div>
+          </div>"""
+
+
+def _render_schedule_table(schedule: list) -> str:
+    if not schedule:
+        return f"""
+    <div class="card">
+      <h2>Full Schedule</h2>
+      <div class="no-data">{NO_DATA}</div>
+    </div>"""
+    rows = ""
+    for g in schedule:
+        result = g.get("result")
+        opponent = g.get('opponent') or 'Unknown'
+        if result:
+            badge_class = "badge-win" if result.startswith("W") else (
+                "badge-loss" if result.startswith("L") else "badge-final")
+            result_html = f'<span class="badge {badge_class}">{_esc(result)}</span>'
+        elif _is_placeholder_opponent(opponent):
+            result_html = '<span class="badge badge-tba">TBA</span>'
+        else:
+            result_html = '<span class="badge badge-upcoming">Upcoming</span>'
+        logo_url = g.get('opponent_logo_url')
+        if logo_url:
+            opp_cell = (f'<img class="sched-logo" src="{_esc(logo_url)}" alt="" loading="lazy" '
+                        f'onerror="this.remove()">{_esc(opponent)}')
+        else:
+            opp_cell = _esc(opponent)
+        rows += f"""
+          <tr>
+            <td>{_esc(g.get('date_time_raw')) or 'TBD'}</td>
+            <td>{_esc(g.get('home_away'))}</td>
+            <td class="opp-cell">{opp_cell}</td>
+            <td>{result_html}</td>
+          </tr>"""
+    return f"""
+    <div class="card">
+      <h2>Full Schedule</h2>
+      <div class="table-wrap">
+      <table>
+        <thead><tr><th>Date</th><th></th><th>Opponent</th><th>Result</th></tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+      </div>
+    </div>"""
+
+
+def _render_standings(standings: dict) -> str:
+    if not standings:
+        return f"""
+    <div class="card">
+      <h2>Standings</h2>
+      <div class="no-data">{NO_DATA}</div>
+    </div>"""
+    section_html = ""
+    for section, rows in standings.items():
+        row_html = ""
+        for idx, r in enumerate(rows, start=1):
+            team = r.get("team") or "Unknown"
+            is_il = "Indian Land" in team
+            row_html += f"""
+              <tr class="{'highlight' if is_il else ''}">
+                <td><span class="rank-chip">{idx}</span>{_esc(team)}</td>
+                <td>{_esc(r.get('record')) or '-'}</td>
+              </tr>"""
+        section_html += f"""
+          <div class="standings-section">
+            <h3>{_esc(section)}</h3>
+            <div class="table-wrap">
+            <table>
+              <thead><tr><th>Team</th><th>Record</th></tr></thead>
+              <tbody>{row_html}</tbody>
+            </table>
+            </div>
+          </div>"""
+    return f"""
+    <div class="card">
+      <h2>Standings</h2>
+      {section_html}
+    </div>"""
+
+
+def _render_star_players(star_players: list) -> str:
+    if star_players:
+        by_category = {}
+        for sp in star_players:
+            by_category.setdefault(sp["category"], []).append(sp)
+        body = ""
+        for category, players in by_category.items():
+            cards = ""
+            for sp in players:
+                url = sp.get("player_url") or "#"
+                value = _esc(sp.get("value")) if sp.get("value") else ""
+                cards += f"""
+                  <a class="player-card" href="{_esc(url)}" target="_blank" rel="noopener">
+                    <div class="player-name">{_esc(sp.get('player'))}</div>
+                    <div class="player-value">{value}</div>
+                  </a>"""
+            body += f"""
+              <div class="star-category">
+                <h3>{_esc(category)}</h3>
+                <div class="player-row">{cards}</div>
+              </div>"""
+    else:
+        body = f'<div class="no-data">{NO_DATA} \u2014 MaxPreps shows no player stats entered for this team yet.</div>'
+    return f"""
+    <div class="card">
+      <h2>Star Players</h2>
+      {body}
+    </div>"""
+
+
+def _render_changes(changes: list) -> str:
+    if changes:
+        body = "<ul class='changes-list'>" + "".join(
+            f"<li>{_esc(c)}</li>" for c in changes) + "</ul>"
+    else:
+        body = "<p class='no-changes'>No changes since the last check.</p>"
+    return f"""
+    <div class="card">
+      <h2>Recent Changes</h2>
+      {body}
+    </div>"""
+
+
+def _render_sport_main(snapshot: dict, changes: list) -> str:
+    if snapshot is None:
+        return f"""
+    <div class="card">
+      <h2>Status</h2>
+      <div class="no-data">{NO_DATA} \u2014 could not fetch this sport's MaxPreps pages.</div>
+    </div>"""
+    return f"""
+    {_render_stat_cards(snapshot.get('overview', {}))}
+    {_render_next_game(snapshot.get('next_game'), snapshot.get('team_logo_url'))}
+    {_render_schedule_table(snapshot.get('schedule', []))}
+    {_render_standings(snapshot.get('standings', {}))}
+    {_render_star_players(snapshot.get('star_players', []))}
+    {_render_changes(changes)}"""
+
+
+def _render_ticker(sports_snapshot: dict) -> str:
+    """One scrolling ESPN-style bottom-line item per sport: icon, name, and
+    overall record (or 'No data' when the team page hasn't posted one)."""
+    items = []
+    for sport in SPORTS:
+        snap = sports_snapshot.get(sport["key"])
+        record = NO_DATA
+        if snap:
+            record = (snap.get("overview", {}) or {}).get("overall_record") or NO_DATA
+        items.append(
+            f'<span class="ticker-item">{sport["icon"]} '
+            f'{_esc(sport["label"].upper())} <strong>{_esc(record)}</strong></span>'
+        )
+    track = "".join(items)
+    return track + track  # duplicated so the CSS loop scrolls seamlessly
+
+
+def build_dashboard_html(combined_snapshot: dict, combined_changes: dict, refresh_seconds: int) -> str:
+    """Render every sport as tabs on a single self-contained ESPN-style page.
+
+    Switching tabs briefly shows a loading screen (spinner + "Loading
+    Scoreboard...") before the sport's content fades in -- purely a UI
+    transition, no video/media file required. The dashboard also opens with
+    that same loading screen for a couple hundred milliseconds so it reads
+    like a live scoreboard app booting up.
+    """
+    sports_snapshot = combined_snapshot.get("sports", {})
+    fetched_at = _esc(combined_snapshot.get("fetched_at"))
+    refresh_tag = f'<meta http-equiv="refresh" content="{refresh_seconds}">' if refresh_seconds else ""
+    sport_keys_js = ", ".join(f"'{s['key']}'" for s in SPORTS)
+    refresh_minutes = refresh_seconds // 60 if refresh_seconds else 30
+
+    # Same school logo regardless of sport -- use whichever sport's page we
+    # actually managed to fetch it from first.
+    canonical_logo_url = None
+    for sport in SPORTS:
+        snap = sports_snapshot.get(sport["key"])
+        if snap and snap.get("team_logo_url"):
+            canonical_logo_url = snap["team_logo_url"]
+            break
+    header_badge_html = _team_badge_html(canonical_logo_url, "IL")
+
+    ticker_html = _render_ticker(sports_snapshot)
+
+    tab_buttons = []
+    pages_html = []
+    for i, sport in enumerate(SPORTS):
+        key = sport["key"]
+        snap = sports_snapshot.get(key)
+        changes = combined_changes.get(key, [])
+        active = " active" if i == 0 else ""
+
+        tab_buttons.append(
+            f'<button id="tab-{key}" class="tab-btn{active}" role="tab" '
+            f'aria-selected="{"true" if i == 0 else "false"}" aria-controls="page-{key}" '
+            f'tabindex="{"0" if i == 0 else "-1"}" data-key="{key}" '
+            f'onclick="showSport(\'{key}\')">{sport["icon"]} {_esc(sport["label"])}</button>'
+        )
+
+        main_html = _render_sport_main(snap, changes)
+        pages_html.append(f"""
+  <div id="page-{key}" class="page{active}" role="tabpanel" aria-labelledby="tab-{key}">
+    <main class="{'pulse-in' if i == 0 else ''}">
+      {main_html}
+    </main>
+    <footer>
+      Auto-generated from MaxPreps &middot; refreshes automatically while the monitor script is running
+      <br>
+      <a class="youtube-link" href="{YOUTUBE_CHANNEL_URL}" target="_blank" rel="noopener">
+        &#9658; ILHS Warrior News Network
+      </a>
+    </footer>
+  </div>""")
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{refresh_tag}
+<title>Indian Land Warriors Sports</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect width=%22100%22 height=%22100%22 fill=%22%230d0d0d%22/><text x=%2250%22 y=%2268%22 font-size=%2258%22 font-family=%22Arial,sans-serif%22 font-weight=%22bold%22 fill=%22%23d50a0a%22 text-anchor=%22middle%22>IL</text></svg>">
+<noscript><style>.loading-overlay{{ display: none !important; }}</style></noscript>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --red: #d50a0a;
+    --black: #0d0d0d;
+    --dark: #171717;
+    --panel: #ffffff;
+    --bg: #eef0f2;
+    --gray: #6b6b70;
+    --line: #dfe1e4;
+    --green: #0a8f3c;
+  }}
+  * {{ box-sizing: border-box; }}
+  html, body {{ margin: 0; background: var(--bg); }}
+  body {{
+    font-family: 'Roboto', -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: var(--black);
+    min-height: 100vh;
+  }}
+  h1, h2, h3, .headline {{ font-family: 'Oswald', sans-serif; text-transform: uppercase; }}
+
+  /* ---------- loading screen ---------- */
+  .loading-overlay {{
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    background: var(--black);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+  }}
+  .loading-overlay.active {{ opacity: 1; pointer-events: all; }}
+  .spinner {{
+    width: 52px; height: 52px;
+    border: 5px solid rgba(255,255,255,0.15);
+    border-top-color: var(--red);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-bottom: 18px;
+  }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .loading-text {{
+    color: white;
+    font-family: 'Oswald', sans-serif;
+    letter-spacing: 2px;
+    font-size: 0.85rem;
+    text-transform: uppercase;
+  }}
+
+  .page {{
+    display: none;
+    opacity: 0;
+    min-height: 100vh;
+    transition: opacity 0.4s ease;
+  }}
+  .page.active {{ display: block; opacity: 1; }}
+
+  @keyframes pulse-in {{
+    0% {{ opacity: 0; transform: translateY(6px); }}
+    100% {{ opacity: 1; transform: translateY(0); }}
+  }}
+  main.pulse-in {{ animation: pulse-in 0.35s ease; }}
+
+  /* ---------- header ---------- */
+  header {{
+    background: var(--black);
+    border-bottom: 4px solid var(--red);
+    padding: 16px 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    position: relative;
+    overflow: hidden;
+  }}
+  header::before {{
+    content: "";
+    position: absolute;
+    top: 0; bottom: 0;
+    left: -10%;
+    width: 45%;
+    background: linear-gradient(100deg, transparent 40%, rgba(213,10,10,0.35) 40%, rgba(213,10,10,0.35) 55%, transparent 55%);
+    pointer-events: none;
+  }}
+  .team-badge {{
+    width: 42px; height: 42px; border-radius: 50%;
+    background: var(--red); color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Oswald', sans-serif; font-weight: 700; font-size: 1.1rem;
+    flex-shrink: 0;
+    box-shadow: 0 0 0 3px rgba(255,255,255,0.08);
+    position: relative;
+    z-index: 1;
+  }}
+  header h1 {{
+    margin: 0; color: white; font-size: 1.3rem; font-weight: 700; letter-spacing: 1px;
+    line-height: 1.1;
+    font-style: italic;
+    position: relative;
+    z-index: 1;
+  }}
+  .refresh-btn {{
+    position: absolute; z-index: 2; right: 16px; top: 50%; transform: translateY(-50%);
+    background: transparent; border: 1px solid rgba(255,255,255,0.35); color: white;
+    width: 34px; height: 34px; border-radius: 50%; font-size: 1.15rem; line-height: 1;
+    cursor: pointer; flex-shrink: 0;
+    transition: transform 0.5s ease, background 0.15s ease;
+  }}
+  .refresh-btn:active {{ transform: translateY(-50%) rotate(180deg); }}
+  .refresh-btn:hover {{ background: rgba(255,255,255,0.1); }}
+  button:focus-visible, a:focus-visible {{
+    outline: 2px solid var(--red); outline-offset: 2px;
+  }}
+  header .sub {{
+    color: #9a9a9e; font-size: 0.72rem; letter-spacing: 0.5px; margin-top: 2px;
+    text-transform: none; font-family: 'Roboto', sans-serif;
+    display: flex; align-items: center; gap: 6px;
+    position: relative;
+    z-index: 1;
+  }}
+  .live-dot {{
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--red);
+    display: inline-block;
+    animation: live-pulse 1.4s ease-in-out infinite;
+    flex-shrink: 0;
+  }}
+  @keyframes live-pulse {{
+    0%, 100% {{ opacity: 1; box-shadow: 0 0 0 0 rgba(213,10,10,0.6); }}
+    50% {{ opacity: 0.55; box-shadow: 0 0 0 4px rgba(213,10,10,0); }}
+  }}
+
+  /* ---------- scrolling score ticker ---------- */
+  .ticker {{
+    background: var(--red);
+    overflow: hidden;
+    white-space: nowrap;
+    border-bottom: 2px solid var(--black);
+  }}
+  .ticker-track {{
+    display: inline-block;
+    padding-left: 100%;
+    animation: ticker-scroll 34s linear infinite;
+  }}
+  .ticker:hover .ticker-track, .ticker:focus-within .ticker-track {{ animation-play-state: paused; }}
+  @media (prefers-reduced-motion: reduce) {{
+    .ticker-track {{ animation: none; }}
+    .ticker {{ overflow-x: auto; }}
+  }}
+  .ticker-item {{
+    display: inline-block;
+    color: white;
+    font-family: 'Oswald', sans-serif;
+    font-size: 0.76rem;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    padding: 8px 26px 8px 20px;
+    text-transform: uppercase;
+    position: relative;
+  }}
+  .ticker-item::after {{
+    content: "";
+    position: absolute;
+    right: 0; top: 50%;
+    width: 10px; height: 10px;
+    background: rgba(0,0,0,0.55);
+    transform: translateY(-50%) rotate(45deg);
+  }}
+  .ticker-item strong {{ margin-left: 4px; font-style: italic; }}
+  @keyframes ticker-scroll {{
+    0% {{ transform: translateX(0); }}
+    100% {{ transform: translateX(-50%); }}
+  }}
+
+  /* ---------- sport tab bar ---------- */
+  .sport-toggle {{
+    display: flex;
+    background: var(--dark);
+    border-bottom: 1px solid #2a2a2a;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }}
+  .sport-toggle button {{
+    flex: 0 0 auto;
+    background: transparent; border: none; color: #9a9a9e;
+    font-family: 'Oswald', sans-serif; font-weight: 600; letter-spacing: 0.8px;
+    font-size: 0.85rem; text-transform: uppercase; padding: 13px 18px 10px; cursor: pointer;
+    border-bottom: 3px solid transparent; transition: all 0.15s ease;
+    white-space: nowrap;
+    position: relative;
+  }}
+  .sport-toggle button.active {{
+    color: white;
+    border-bottom-color: var(--red);
+  }}
+  .sport-toggle button.active::before {{
+    content: "";
+    position: absolute;
+    bottom: -3px; left: 50%;
+    width: 14px; height: 3px;
+    background: var(--red);
+    transform: translateX(-50%) skewX(-20deg);
+  }}
+  .sport-toggle button:hover {{ color: white; }}
+
+  main {{ max-width: 900px; margin: 0 auto; padding: 18px 16px 10px; }}
+
+  /* ---------- scoreboard stat strip ---------- */
+  .stats-row {{ display: flex; gap: 12px; margin-bottom: 16px; }}
+  .stat-card {{
+    flex: 1; background: var(--panel); border-top: 4px solid var(--red);
+    padding: 14px 8px; text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    position: relative;
+    overflow: hidden;
+  }}
+  .stat-card::after {{
+    content: "";
+    position: absolute;
+    top: -14px; right: -14px;
+    width: 28px; height: 28px;
+    background: var(--red);
+    transform: rotate(45deg);
+    opacity: 0.9;
+  }}
+  .stat-card .label {{
+    font-family: 'Oswald', sans-serif; font-size: 0.68rem; letter-spacing: 1px;
+    color: var(--gray); text-transform: uppercase; margin-bottom: 4px;
+  }}
+  .stat-card .value {{
+    font-family: 'Oswald', sans-serif; font-size: 1.6rem; font-weight: 700; color: var(--black);
+    font-style: italic;
+  }}
+
+  /* ---------- next game / matchup card ---------- */
+  .next-game {{
+    background: var(--black); color: white; padding: 20px 20px 18px;
+    margin-bottom: 16px; position: relative; overflow: hidden;
+  }}
+  .next-game::before {{
+    content: "";
+    position: absolute; inset: 0;
+    background: linear-gradient(115deg, transparent 55%, rgba(213,10,10,0.5) 55%, rgba(213,10,10,0.5) 62%, transparent 62%);
+    pointer-events: none;
+  }}
+  .ng-label {{
+    display: inline-block; background: var(--red); color: white;
+    font-family: 'Oswald', sans-serif; font-size: 0.65rem; letter-spacing: 1.5px;
+    padding: 3px 14px; margin-bottom: 14px; text-transform: uppercase;
+    clip-path: polygon(6% 0, 100% 0, 94% 100%, 0 100%);
+    position: relative; z-index: 1;
+  }}
+  .matchup-row {{
+    display: flex; align-items: center; justify-content: center; gap: 16px;
+    position: relative; z-index: 1;
+  }}
+  .team-side {{
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    flex: 1; min-width: 0;
+  }}
+  .team-side .team-badge {{ width: 48px; height: 48px; font-size: 1.15rem; }}
+  .team-side .opp-badge {{ background: var(--dark); border: 2px solid var(--red); }}
+  .logo-img {{
+    object-fit: contain;
+    background: white;
+    padding: 4px;
+  }}
+  .sched-logo {{
+    width: 18px; height: 18px;
+    object-fit: contain;
+    vertical-align: middle;
+    margin-right: 6px;
+    border-radius: 50%;
+    background: white;
+  }}
+  .opp-cell {{ display: flex; align-items: center; }}
+  .team-name {{
+    font-family: 'Oswald', sans-serif; font-size: 0.78rem; font-weight: 600;
+    text-transform: uppercase; text-align: center;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%;
+  }}
+  .vs-wrap {{ flex-shrink: 0; }}
+  .vs-text {{
+    display: inline-block;
+    font-family: 'Oswald', sans-serif;
+    font-weight: 700;
+    font-style: italic;
+    font-size: 1rem;
+    color: var(--black);
+    background: white;
+    padding: 4px 14px;
+    clip-path: polygon(12% 0, 100% 0, 88% 100%, 0 100%);
+  }}
+  .ng-date {{
+    color: #b8b8bc; margin-top: 16px; font-size: 0.9rem; text-align: center;
+    position: relative; z-index: 1;
+  }}
+  .next-game-empty .no-data {{
+    background: transparent; border: 1px dashed rgba(255,255,255,0.3);
+    color: #b8b8bc; text-align: left; padding: 12px 14px;
+    position: relative; z-index: 1;
+  }}
+
+  /* ---------- cards ---------- */
+  .card {{
+    background: var(--panel); padding: 16px 18px; margin-bottom: 16px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    transition: box-shadow 0.4s ease, transform 0.4s ease;
+  }}
+  .card h2 {{
+    margin: 0 0 12px 0; font-size: 1rem; font-weight: 600; color: var(--black);
+    padding-bottom: 8px; letter-spacing: 0.5px;
+    position: relative;
+  }}
+  .card h2::after {{
+    content: "";
+    display: block;
+    margin-top: 8px;
+    height: 4px;
+    width: 46px;
+    background: var(--red);
+    transform: skewX(-20deg);
+  }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; }}
+  th, td {{ text-align: left; padding: 9px 6px; border-bottom: 1px solid var(--line); }}
+  th {{
+    font-family: 'Oswald', sans-serif; color: var(--gray); font-weight: 500;
+    font-size: 0.7rem; letter-spacing: 0.5px; text-transform: uppercase;
+  }}
+  tr.highlight td {{ background: #fdeaea; font-weight: 700; }}
+  .rank-chip {{
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: var(--black); color: white;
+    font-family: 'Oswald', sans-serif; font-size: 0.68rem; font-weight: 700;
+    margin-right: 8px;
+  }}
+  tr.highlight .rank-chip {{ background: var(--red); }}
+  .badge {{
+    display: inline-block; padding: 3px 14px; border-radius: 0;
+    font-family: 'Oswald', sans-serif; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.5px;
+    clip-path: polygon(10% 0, 100% 0, 90% 100%, 0 100%);
+  }}
+  .badge-win {{ background: var(--green); color: white; }}
+  .badge-loss {{ background: var(--red); color: white; }}
+  .badge-final {{ background: #e5e7eb; color: var(--gray); }}
+  .badge-upcoming {{ background: var(--black); color: white; }}
+  .badge-tba {{ background: var(--gray); color: white; font-style: italic; }}
+  .standings-section {{ margin-bottom: 14px; }}
+  .standings-section h3 {{
+    font-family: 'Oswald', sans-serif; font-size: 0.85rem; color: var(--black);
+    margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px;
+  }}
+  .star-category {{ margin-bottom: 16px; }}
+  .star-category h3 {{
+    font-family: 'Oswald', sans-serif; font-size: 0.85rem; color: var(--black);
+    margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px;
+  }}
+  .player-row {{ display: flex; gap: 10px; flex-wrap: wrap; }}
+  .player-card {{
+    display: block; text-decoration: none; background: var(--bg); border-left: 3px solid var(--red);
+    padding: 9px 14px; min-width: 120px; transition: background 0.15s ease;
+  }}
+  .player-card:hover {{ background: #e2e5e9; }}
+  .player-name {{ font-weight: 700; color: var(--black); font-size: 0.85rem; }}
+  .player-value {{ font-family: 'Oswald', sans-serif; color: var(--red); font-weight: 700; font-size: 1.05rem; margin-top: 2px; }}
+  .changes-list {{ margin: 0; padding-left: 18px; font-size: 0.88rem; }}
+  .changes-list li {{ margin-bottom: 6px; }}
+  .no-changes {{ color: var(--gray); font-style: italic; margin: 0; font-size: 0.88rem; }}
+
+  /* ---------- no-data placeholder ---------- */
+  .no-data {{
+    background: repeating-linear-gradient(45deg, #f4f4f5, #f4f4f5 10px, #ececee 10px, #ececee 20px);
+    border: 1px dashed var(--line);
+    color: var(--gray);
+    font-family: 'Oswald', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 0.8rem;
+    text-align: center;
+    padding: 20px 12px;
+  }}
+
+  .youtube-link {{
+    display: inline-flex; align-items: center; gap: 8px; background: var(--red); color: white;
+    text-decoration: none; padding: 10px 18px; font-weight: 700; font-family: 'Oswald', sans-serif;
+    letter-spacing: 0.5px; text-transform: uppercase; font-size: 0.85rem; margin-top: 8px;
+  }}
+  .youtube-link:hover {{ background: #b00808; }}
+  footer {{ text-align: center; color: var(--gray); font-size: 0.78rem; padding: 22px 20px 34px; }}
+
+  /* ---------- scrollable table container (prevents page-wide overflow) ---------- */
+  .table-wrap {{ overflow-x: auto; -webkit-overflow-scrolling: touch; }}
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 480px) {{
+    header {{ padding: 14px 48px 14px 14px; gap: 10px; }}
+    header h1 {{ font-size: 1.08rem; }}
+    header .sub {{ font-size: 0.66rem; }}
+    .team-badge {{ width: 36px; height: 36px; font-size: 0.95rem; }}
+    .refresh-btn {{ right: 10px; width: 30px; height: 30px; font-size: 1rem; }}
+
+    main {{ padding: 14px 10px 6px; }}
+
+    .stats-row {{ gap: 8px; }}
+    .stat-card {{ padding: 10px 4px; }}
+    .stat-card .label {{ font-size: 0.6rem; }}
+    .stat-card .value {{ font-size: 1.25rem; }}
+
+    .next-game {{ padding: 16px 14px 14px; }}
+    .matchup-row {{ gap: 8px; }}
+    .team-side .team-badge {{ width: 40px; height: 40px; font-size: 0.95rem; }}
+    .team-name {{ font-size: 0.68rem; }}
+    .vs-text {{ font-size: 0.85rem; padding: 3px 10px; }}
+
+    .card {{ padding: 14px 12px; }}
+    table {{ font-size: 0.8rem; }}
+    th, td {{ padding: 7px 5px; }}
+    .sched-logo {{ width: 15px; height: 15px; margin-right: 4px; }}
+
+    .player-row {{ gap: 8px; }}
+    .player-card {{ min-width: 100px; padding: 8px 10px; }}
+
+    .sport-toggle button {{ padding: 11px 12px 8px; font-size: 0.76rem; }}
+  }}
+
+  @media (max-width: 360px) {{
+    .stats-row {{ flex-wrap: wrap; }}
+    .stat-card {{ flex: 1 1 calc(50% - 8px); }}
+  }}
+</style>
+</head>
+<body>
+
+  <div class="loading-overlay active" id="loading-overlay">
+    <div class="spinner"></div>
+    <div class="loading-text">Loading Scoreboard<span class="loading-dots"><span>.</span><span>.</span><span>.</span></span></div>
+  </div>
+
+  <header>
+    {header_badge_html}
+    <div>
+      <h1>Indian Land Warriors</h1>
+      <div class="sub"><span class="live-dot"></span>Indian Land, SC &middot; <span id="last-checked" data-fetched-at="{fetched_at}">Last checked {fetched_at}</span></div>
+    </div>
+    <button class="refresh-btn" id="refresh-btn" onclick="location.reload()" aria-label="Refresh dashboard now" title="Refresh now">&#8635;</button>
+  </header>
+
+  <div class="ticker"><div class="ticker-track">{ticker_html}</div></div>
+
+  <nav class="sport-toggle" role="tablist" aria-label="Sport">
+    {"".join(tab_buttons)}
+  </nav>
+
+  {"".join(pages_html)}
+
+  <script>
+    var SPORT_KEYS = [{sport_keys_js}];
+    var TAB_STORAGE_KEY = 'il-warriors-active-tab';
+
+    function logoFallback(img, text) {{
+      var div = document.createElement('div');
+      div.className = img.className.replace('logo-img', '').trim();
+      div.textContent = text;
+      img.replaceWith(div);
+    }}
+
+    function showLoading(cb) {{
+      var overlay = document.getElementById('loading-overlay');
+      overlay.classList.add('active');
+      setTimeout(function() {{
+        overlay.classList.remove('active');
+        if (cb) cb();
+      }}, 500);
+    }}
+
+    function showSport(key, opts) {{
+      opts = opts || {{}};
+      function apply() {{
+        var pages = document.querySelectorAll('.page');
+        pages.forEach(function(el) {{ el.classList.remove('active'); }});
+        var tabs = document.querySelectorAll('.tab-btn');
+        tabs.forEach(function(el) {{
+          el.classList.remove('active');
+          el.setAttribute('aria-selected', 'false');
+          el.setAttribute('tabindex', '-1');
+        }});
+        var page = document.getElementById('page-' + key);
+        var tab = document.getElementById('tab-' + key);
+        if (page) {{ page.classList.add('active'); }}
+        if (tab) {{
+          tab.classList.add('active');
+          tab.setAttribute('aria-selected', 'true');
+          tab.setAttribute('tabindex', '0');
+        }}
+        var main = page ? page.querySelector('main') : null;
+        if (main) {{
+          main.classList.remove('pulse-in');
+          void main.offsetWidth; // reflow to restart the animation
+          main.classList.add('pulse-in');
+        }}
+        try {{ localStorage.setItem(TAB_STORAGE_KEY, key); }} catch (e) {{ /* storage unavailable */ }}
+      }}
+      if (opts.silent) {{ apply(); }} else {{ showLoading(apply); }}
+    }}
+
+    // Arrow-key navigation between tabs, per standard ARIA tab pattern.
+    document.addEventListener('keydown', function(e) {{
+      if (e.target && e.target.classList && e.target.classList.contains('tab-btn') &&
+          (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) {{
+        var idx = SPORT_KEYS.indexOf(e.target.getAttribute('data-key'));
+        if (idx === -1) return;
+        var next = e.key === 'ArrowRight'
+          ? (idx + 1) % SPORT_KEYS.length
+          : (idx - 1 + SPORT_KEYS.length) % SPORT_KEYS.length;
+        var nextTab = document.getElementById('tab-' + SPORT_KEYS[next]);
+        if (nextTab) {{ nextTab.focus(); showSport(SPORT_KEYS[next]); }}
+        e.preventDefault();
+      }}
+    }});
+
+    function updateLastChecked() {{
+      var el = document.getElementById('last-checked');
+      if (!el) return;
+      var iso = el.getAttribute('data-fetched-at');
+      var then = new Date(iso);
+      if (isNaN(then.getTime())) return;
+      var secs = Math.max(0, Math.round((Date.now() - then.getTime()) / 1000));
+      var label;
+      if (secs < 60) {{ label = 'just now'; }}
+      else if (secs < 3600) {{ label = Math.round(secs / 60) + ' min ago'; }}
+      else {{ label = Math.round(secs / 3600) + ' hr ago'; }}
+      el.textContent = 'Last checked ' + label;
+    }}
+
+    document.addEventListener('DOMContentLoaded', function() {{
+      // Restore whichever sport tab the user had open before the page's
+      // periodic auto-refresh reloaded it, so they don't get bounced back
+      // to the first tab every {refresh_minutes} minutes.
+      try {{
+        var saved = localStorage.getItem(TAB_STORAGE_KEY);
+        if (saved && SPORT_KEYS.indexOf(saved) !== -1) {{
+          showSport(saved, {{ silent: true }});
+        }}
+      }} catch (e) {{ /* storage unavailable, keep server-rendered default tab */ }}
+
+      updateLastChecked();
+      setInterval(updateLastChecked, 30000);
+
+      setTimeout(function() {{
+        var overlay = document.getElementById('loading-overlay');
+        if (overlay) {{ overlay.classList.remove('active'); }}
+      }}, 700);
+    }});
+  </script>
+</body>
+</html>"""
+
+
+def run_once(state_path: Path, html_path: Path = None, refresh_seconds: int = 0) -> list:
+    snapshot = build_combined_snapshot()
+    old = load_state(state_path)
+    combined_changes = diff_combined_snapshots(old, snapshot)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    save_state(state_path, snapshot)
+    print_report(snapshot)
+
+    all_changes = []
+    for sport in SPORTS:
+        for c in combined_changes.get(sport["key"], []):
+            all_changes.append(f"[{sport['label']}] {c}")
+
+    if all_changes:
+        print("\nCHANGES SINCE LAST CHECK:")
+        for c in all_changes:
+            print(f"  * {c}")
+            logging.info("CHANGE: %s", c)
+    else:
+        print("\nNo changes since last check.")
+
+    if html_path:
+        html = build_dashboard_html(snapshot, combined_changes, refresh_seconds)
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.write_text(html, encoding="utf-8")
+        print(f"\nDashboard updated: {html_path.resolve()}")
+
+    return all_changes
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Monitor Indian Land Warriors football, basketball, soccer, "
+                     "volleyball (girls & boys), baseball, and softball on MaxPreps.")
+    parser.add_argument("--once", action="store_true", help="Run a single check and exit.")
+    parser.add_argument("--interval", type=int, default=30, help="Minutes between checks (default 30).")
+    parser.add_argument("--state", type=str, default=DEFAULT_STATE_FILE, help="Path to state JSON file.")
+    parser.add_argument("--log", type=str, default=DEFAULT_LOG_FILE, help="Path to log file.")
+    parser.add_argument("--html", type=str, default=DEFAULT_HTML_FILE,
+                         help="Path to write the HTML dashboard (default indian_land_dashboard.html).")
+    parser.add_argument("--no-html", action="store_true", help="Don't write an HTML dashboard.")
+    parser.add_argument("--no-open", action="store_true",
+                         help="Don't automatically open the dashboard in your browser.")
+    parser.add_argument("--refresh-minutes", type=int, default=None,
+                         help="Minutes between the dashboard page's own auto-reload "
+                              "(<meta refresh>) in visitors' browsers. Defaults to --interval. "
+                              "Set to 0 to disable self-reload (e.g. a one-off --once report "
+                              "you don't want auto-reloading). Independent of --interval, which "
+                              "controls how often *this script* re-polls MaxPreps -- useful when "
+                              "--once is driven by an external scheduler (cron/CI) but you still "
+                              "want the published page itself to auto-refresh for readers.")
+    args = parser.parse_args()
+
+    state_path = Path(args.state)
+    html_path = None if args.no_html else Path(args.html)
+    refresh_minutes = args.interval if args.refresh_minutes is None else args.refresh_minutes
+    refresh_seconds = max(0, refresh_minutes) * 60
+
+    log_path = Path(args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(
+        filename=str(log_path),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    # Also echo INFO+ to console
+    console = logging.StreamHandler()
+    console.setLevel(logging.WARNING)  # keep console clean; report printing handles normal output
+    logging.getLogger().addHandler(console)
+
+    if not _HAS_CLOUDSCRAPER:
+        print("NOTE: 'cloudscraper' is not installed -- if you hit 406 errors, run:")
+        print("      pip install cloudscraper")
+        print("      then try again.\n")
+
+    if args.once:
+        run_once(state_path, html_path, refresh_seconds=refresh_seconds)
+        if html_path and not args.no_open:
+            webbrowser.open(html_path.resolve().as_uri())
+        return
+
+    print(f"Monitoring Indian Land Warriors sports. Checking every {args.interval} min. "
+          f"Ctrl+C to stop.\n")
+    if html_path:
+        print(f"Dashboard will be written to: {html_path.resolve()}")
+        print("It will open automatically in your browser and auto-refresh from there.\n")
+    try:
+        first_run = True
+        while True:
+            try:
+                run_once(state_path, html_path, refresh_seconds)
+                if first_run and html_path and not args.no_open:
+                    webbrowser.open(html_path.resolve().as_uri())
+                    first_run = False
+            except Exception as e:
+                logging.error("Error during check: %s", e)
+                print(f"Error during check: {e}")
+            print(f"\nSleeping {args.interval} minutes...\n")
+            time.sleep(args.interval * 60)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
