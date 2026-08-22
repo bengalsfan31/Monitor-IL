@@ -1,0 +1,50 @@
+name: Update Indian Land Sports Dashboard
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub may delay scheduled runs a few minutes under
+    # load -- that's normal and fine for this use case.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # adds a "Run workflow" button in the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dashboard-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor (single check, write dashboard into docs/)
+        run: >
+          python monitor_indian_land.py --once --no-open
+          --html docs/index.html
+          --state state/indian_land_state.json
+          --log state/indian_land_monitor.log
+          --refresh-minutes 30
+
+      - name: Commit and push if anything changed
+        run: |
+          git config user.name "dashboard-bot"
+          git config user.email "dashboard-bot@users.noreply.github.com"
+          git add docs/index.html state/indian_land_state.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update dashboard: $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
